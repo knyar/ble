@@ -37,7 +37,11 @@ type manager struct {
 //todo: remove bond manager from input parameters?
 func NewSmpManager(config hci.SmpConfig, bm hci.BondManager, l ble.Logger) *manager {
 	p := &pairingContext{request: config, state: Init, Logger: l}
-	m := &manager{config: config, pairing: p, bondManager: bm, result: make(chan error), Logger: l}
+	// result is buffered and only ever written to with non-blocking sends:
+	// pairing can fail (or finish) when no Pair() call is waiting for the
+	// result, e.g. after Pair() timed out or for peripheral-initiated
+	// pairing, and a blocking send would wedge the connection's read loop.
+	m := &manager{config: config, pairing: p, bondManager: bm, result: make(chan error, 1), Logger: l}
 	t := NewSmpTransport(p, bm, m, nil, nil, l)
 	m.t = t
 	return m
@@ -89,24 +93,45 @@ func (m *manager) Handle(in []byte) error {
 	_, err := v.handler(m.t, data)
 	if err != nil {
 		m.t.pairing.state = Error
-		m.result <- err
+		m.deliverResult(err)
 		return err
 	}
 
 	if m.t.pairing.state == Finished {
-		select {
-		case <-m.result:
-		default:
-			close(m.result)
-		}
+		m.deliverResult(nil)
 	}
 
 	return nil
 }
 
+// deliverResult hands the outcome of a pairing attempt to a waiting Pair()
+// call, if any, without ever blocking the caller (the connection read loop).
+func (m *manager) deliverResult(err error) {
+	select {
+	case m.result <- err:
+	default:
+		m.Infof("smp: no waiter for pairing result: %v", err)
+	}
+}
+
 func (m *manager) Pair(authData ble.AuthData, to time.Duration) error {
-	if m.t.pairing.state != Init {
+	switch m.pairing.state {
+	case Init:
+		// First pairing attempt on this connection.
+	case Error, Finished:
+		// A previous attempt ended (possibly one that was triggered by a
+		// security request from the peripheral before the application
+		// called Pair); start over with a fresh context.
+		m.resetPairingContext()
+	default:
 		return fmt.Errorf("Pairing already in progress")
+	}
+
+	// Drain a stale result of a previous attempt, if any, so that
+	// waitResult only sees the outcome of this attempt.
+	select {
+	case <-m.result:
+	default:
 	}
 
 	//todo: can this be made less bad??
@@ -128,6 +153,23 @@ func (m *manager) Pair(authData ble.AuthData, to time.Duration) error {
 	}
 
 	return m.waitResult(to)
+}
+
+// resetPairingContext replaces the pairing context with a fresh one,
+// preserving the connection addresses set by InitContext.
+func (m *manager) resetPairingContext() {
+	old := m.pairing
+	p := &pairingContext{
+		request:        m.config,
+		state:          Init,
+		localAddr:      old.localAddr,
+		localAddrType:  old.localAddrType,
+		remoteAddr:     old.remoteAddr,
+		remoteAddrType: old.remoteAddrType,
+		Logger:         old.Logger,
+	}
+	m.pairing = p
+	m.t.pairing = p
 }
 
 func (m *manager) waitResult(to time.Duration) error {

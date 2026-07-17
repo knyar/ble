@@ -89,7 +89,10 @@ func (p *pairingContext) checkPasskeyConfirm() error {
 	kax := MarshalPublicKeyX(p.scECDHKeys.public)
 	nb := p.remoteRandom
 	i := p.passKeyIteration
-	key := p.authData.GetPasskey()
+	key, err := p.authData.GetPasskey()
+	if err != nil {
+		return fmt.Errorf("get passkey: %w", err)
+	}
 
 	//this gets the bit of the passkey for the current iteration
 	z := 0x80 | (byte)((key&(1<<uint(i)))>>uint(i))
@@ -115,26 +118,30 @@ func (p *pairingContext) checkPasskeyConfirm() error {
 }
 
 // todo: key should be set at the beginning
-func (p *pairingContext) generatePassKeyConfirm() ([]byte, []byte) {
+func (p *pairingContext) generatePassKeyConfirm() ([]byte, []byte, error) {
 	kbx := MarshalPublicKeyX(p.scRemotePubKey)
 	kax := MarshalPublicKeyX(p.scECDHKeys.public)
 	nai := make([]byte, 16)
-	_, err := rand.Read(nai)
-	if err != nil {
+	if _, err := rand.Read(nai); err != nil {
+		return nil, nil, fmt.Errorf("rand: %w", err)
+	}
 
+	key, err := p.authData.GetPasskey()
+	if err != nil {
+		return nil, nil, fmt.Errorf("get passkey: %w", err)
 	}
 
 	i := p.passKeyIteration
-	z := 0x80 | (byte)((p.authData.GetPasskey()&(1<<uint(i)))>>uint(i))
+	z := 0x80 | (byte)((key&(1<<uint(i)))>>uint(i))
 
 	calcConf, err := smpF4(kax, kbx, nai, z)
 	if err != nil {
-		p.Errorf("generatePasskeyConfirm: %v", err)
+		return nil, nil, fmt.Errorf("generatePasskeyConfirm: %w", err)
 	}
 
 	//p.Debugf("passkey confirm %d: z: %x, conf: %v", iteration, z, hex.EncodeToString(calcConf))
 
-	return calcConf, nai
+	return calcConf, nai, nil
 }
 
 func (p *pairingContext) calcMacLtk() error {
@@ -175,8 +182,12 @@ func (p *pairingContext) checkDHKeyCheck() error {
 
 	ra := make([]byte, 16)
 	if p.pairingType == Passkey {
+		key, err := p.authData.GetPasskey()
+		if err != nil {
+			return fmt.Errorf("get passkey: %w", err)
+		}
 		keyBytes := make([]byte, 4)
-		binary.BigEndian.PutUint32(keyBytes, uint32(p.authData.GetPasskey()))
+		binary.BigEndian.PutUint32(keyBytes, uint32(key))
 		ra[12] = keyBytes[0]
 		ra[13] = keyBytes[1]
 		ra[14] = keyBytes[2]
@@ -230,7 +241,11 @@ func (p *pairingContext) checkLegacyConfirm() error {
 
 	k := make([]byte, 16)
 	if p.pairingType == Passkey {
-		k = getLegacyParingTK(p.authData.GetPasskey())
+		key, err := p.authData.GetPasskey()
+		if err != nil {
+			return fmt.Errorf("get passkey: %w", err)
+		}
+		k = getLegacyParingTK(key)
 	}
 	c1, err := smpC1(k, sRand, preq, pres,
 		p.localAddrType,

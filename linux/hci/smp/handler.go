@@ -57,6 +57,15 @@ func smpOnPairingResponse(t *transport, in pdu) ([]byte, error) {
 		return nil, fmt.Errorf("pairing requires OOB data but OOB data not specified")
 	}
 
+	// Abort early rather than running the passkey protocol with a bogus
+	// passkey of 0. This happens in particular when the peripheral
+	// requests security (triggering pairing) before the application has
+	// called Pair with its auth data.
+	if t.pairing.pairingType == Passkey && !t.pairing.authData.HasPasskeySource() {
+		t.pairing.state = Error
+		return nil, fmt.Errorf("pairing requires a passkey but no passkey source was provided")
+	}
+
 	if t.pairing.legacy {
 		return nil, t.sendMConfirm()
 	}
@@ -151,7 +160,11 @@ func onLegacyRandom(t *transport) ([]byte, error) {
 	//calculate STK
 	var k []byte
 	if t.pairing.pairingType == Passkey {
-		k = getLegacyParingTK(t.pairing.authData.GetPasskey())
+		passkey, err := t.pairing.authData.GetPasskey()
+		if err != nil {
+			return nil, fmt.Errorf("get passkey: %w", err)
+		}
+		k = getLegacyParingTK(passkey)
 	} else {
 		k = getLegacyParingTK(0)
 	}
@@ -195,7 +208,9 @@ func smpOnPairingPublicKey(t *transport, in pdu) ([]byte, error) {
 	t.pairing.scRemotePubKey = pubk
 
 	if t.pairing.pairingType == Passkey {
-		startPassKeyPairing(t)
+		if err := startPassKeyPairing(t); err != nil {
+			return nil, err
+		}
 	}
 	return nil, nil
 }
@@ -293,25 +308,29 @@ func handlePassKeyRandom(t *transport) (bool, error) {
 	t.pairing.passKeyIteration++
 
 	if t.pairing.passKeyIteration < passkeyIterationCount {
-		continuePassKeyPairing(t)
+		if err := continuePassKeyPairing(t); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
 
 	return false, nil
 }
 
-func startPassKeyPairing(t *transport) {
-
+func startPassKeyPairing(t *transport) error {
 	t.pairing.passKeyIteration = 0
 
-	continuePassKeyPairing(t)
+	return continuePassKeyPairing(t)
 }
 
-func continuePassKeyPairing(t *transport) {
-	confirm, random := t.pairing.generatePassKeyConfirm()
+func continuePassKeyPairing(t *transport) error {
+	confirm, random, err := t.pairing.generatePassKeyConfirm()
+	if err != nil {
+		return err
+	}
 	t.pairing.localRandom = random
 	out := append([]byte{pairingConfirm}, confirm...)
-	t.send(out)
+	return t.send(out)
 }
 
 // Core spec v5.0 Vol 3, Part H, 2.3.5.1
