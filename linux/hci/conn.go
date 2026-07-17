@@ -460,8 +460,14 @@ func (c *Conn) handleEncryptionChanged(status uint8, enabled uint8) {
 	if status != 0x00 {
 		cmdErr := ErrCommand(status)
 		err = fmt.Errorf(errCmd[cmdErr])
-		if de := c.smp.DeleteBondInfo(); de != nil {
-			c.Errorf("encryptionChanged: failed to delete bond info: %v", err)
+		// Only discard the stored bond when the peer reports that it no
+		// longer has the key (PIN or Key Missing). Any other status (e.g.
+		// a connection timeout) can be a transient link failure, and
+		// deleting the bond would force an unnecessary re-pairing.
+		if cmdErr == ErrPINMissing {
+			if de := c.smp.DeleteBondInfo(); de != nil {
+				c.Errorf("encryptionChanged: failed to delete bond info: %v", de)
+			}
 		}
 	}
 
@@ -485,8 +491,12 @@ func (c *Conn) handleEncryptionKeyRefreshComplete(status uint8) {
 	if status != 0x00 {
 		cmdErr := ErrCommand(status)
 		err = fmt.Errorf(errCmd[cmdErr])
-		if de := c.smp.DeleteBondInfo(); de != nil {
-			c.Errorf("encryptionChanged: failed to delete bond info: %v", err)
+		// See handleEncryptionChanged: only delete the bond when the key
+		// is reported missing, not on transient failures.
+		if cmdErr == ErrPINMissing {
+			if de := c.smp.DeleteBondInfo(); de != nil {
+				c.Errorf("encryptionKeyRefreshComplete: failed to delete bond info: %v", de)
+			}
 		}
 	}
 
