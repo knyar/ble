@@ -5,8 +5,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/rigado/ble"
@@ -15,7 +15,10 @@ import (
 
 type manager struct {
 	filePath string
-	lock     sync.RWMutex
+	// lock is held exclusively by all public methods: even logically
+	// read-only operations may quarantine a corrupt bond file, and Find
+	// deletes invalid entries.
+	lock sync.Mutex
 	ble.Logger
 }
 
@@ -46,8 +49,8 @@ func (m *manager) Exists(addr string) bool {
 		return false
 	}
 
-	m.lock.RLock()
-	defer m.lock.RUnlock()
+	m.lock.Lock()
+	defer m.lock.Unlock()
 
 	bonds, err := m.loadBonds()
 	if err != nil {
@@ -69,8 +72,8 @@ func (m *manager) Find(addr string) (hci.BondInfo, error) {
 		return nil, fmt.Errorf("invalid address")
 	}
 
-	m.lock.RLock()
-	defer m.lock.RUnlock()
+	m.lock.Lock()
+	defer m.lock.Unlock()
 
 	bonds, err := m.loadBonds()
 	if err != nil {
@@ -150,18 +153,12 @@ func (m *manager) Delete(addr string) error {
 
 //this is mutex protected at the public function level
 func (m *manager) loadBonds() (map[string]bondData, error) {
-	//open local file
-	_, err := os.Stat(m.filePath)
-	var f *os.File
+	fileData, err := os.ReadFile(m.filePath)
 	if os.IsNotExist(err) {
-		f, err = os.Create(m.filePath)
-		if err != nil {
-			return nil, fmt.Errorf("unable to create bondData file: %s", err)
-		}
-		_ = f.Close()
+		// A missing file simply means no bonds have been saved yet; it is
+		// created on the first store rather than as a side effect of a read.
+		return make(map[string]bondData), nil
 	}
-
-	fileData, err := ioutil.ReadFile(m.filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read bondData file information: %s", err)
 	}
@@ -170,7 +167,16 @@ func (m *manager) loadBonds() (map[string]bondData, error) {
 	if len(fileData) > 0 {
 		err = json.Unmarshal(fileData, &bonds)
 		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal current bondData info: %s", err)
+			// The file is unreadable (e.g. truncated by a crash mid-write).
+			// Quarantine it and start fresh: leaving it in place would make
+			// every future load - and therefore every Save - fail, with no
+			// way to ever bond again.
+			quarantine := m.filePath + ".corrupt"
+			if renameErr := os.Rename(m.filePath, quarantine); renameErr != nil {
+				return nil, fmt.Errorf("failed to unmarshal current bondData info: %s", err)
+			}
+			m.Errorf("bondManager: bond file was corrupt (%s); moved to %s", err, quarantine)
+			return make(map[string]bondData), nil
 		}
 	}
 
@@ -181,16 +187,50 @@ func (m *manager) loadBonds() (map[string]bondData, error) {
 	return bonds, nil
 }
 
-//this is mutex protected at the public function level
+//this is mutex protected at the public function level.
+//the file is replaced atomically (write to a temp file, fsync, rename) so
+//that a crash or power loss mid-write cannot truncate existing bonds.
 func (m *manager) storeBonds(bonds map[string]bondData) error {
 	out, err := json.Marshal(bonds)
 	if err != nil {
 		return fmt.Errorf("failed to marshal bonds to json: %s", err)
 	}
 
-	err = ioutil.WriteFile(m.filePath, out, 0644)
+	dir, base := filepath.Split(m.filePath)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, base+".tmp")
 	if err != nil {
+		return fmt.Errorf("failed to create temporary bondData file: %s", err)
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+
+	if _, err := tmp.Write(out); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to write bondData information: %s", err)
+	}
+	if err := tmp.Chmod(0644); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to chmod bondData file: %s", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to sync bondData file: %s", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close bondData file: %s", err)
+	}
+
+	if err := os.Rename(tmp.Name(), m.filePath); err != nil {
 		return fmt.Errorf("failed to update bondData information: %s", err)
+	}
+
+	// Best effort: persist the rename itself so the new file survives a
+	// power loss. Not all filesystems support syncing directories.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 
 	return nil
